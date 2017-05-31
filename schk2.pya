@@ -1,0 +1,276 @@
+import math
+import os
+
+from argparse import ArgumentParser
+from datetime import datetime
+
+import numpy as np
+
+from sklearn import tree
+from sklearn.externals import joblib
+
+import sc2reader as sc2
+from sc2reader.events.game import AddToControlGroupEvent
+from sc2reader.events.game import GetControlGroupEvent
+from sc2reader.events.game import SetControlGroupEvent
+from sc2reader.events.game import SelectionEvent
+
+sc2.configure(debug=True)
+
+class Player:
+    def __init__(self, player):  # player object from sc2reader
+        self.name = player.name
+        self.url = player.url
+        # Actual race (only difference from pick_race if pick_race is Random)
+        self.play_race = player.play_race
+        # Race chosen (only difference from play_race if pick_race is Random)
+        self.pick_race = player.pick_race
+        self.hotkeys = [Hotkey(x) for x in range(0, 10)]
+        self.first_hotkey = -1
+
+    def __str__(self):
+        race = self.play_race[:1]
+        if self.play_race != self.pick_race:
+            race += '{}'.format(self.pick_race[:1])
+        return '{}-{}'.format(self.name, race)
+
+    def handle_event(self, event):
+        key = event.control_group
+        if self.first_hotkey < 0:
+            self.first_hotkey = key
+        self.hotkeys[key].handle_event(event)
+
+    def verbose(self):
+        race = self.play_race[:1]
+        if self.play_race != self.pick_race:
+            race += '/{}'.format(self.pick_race[:1])
+        hotkeys = ''
+        for hk in self.hotkeys:
+            hotkeys += '{}\n'.format(hk)
+        return '{} ({}):\n{}'.format(self.name, race, hotkeys)
+
+    def get_dataset(self):
+        race = -1
+        if self.play_race is 'Terran':
+            race = 0
+        elif self.play_race is 'Protoss':
+            race = 1
+        elif self.pick_race is 'Zerg':
+            race = 2
+        dataset = [race]
+        for hk in self.hotkeys:
+            dataset += hk.get_dataset()
+        return dataset
+
+class Hotkey:
+    def __init__(self, key, bucket_size_minutes = 5, max_game_length=45):
+        self.key = key
+        self.buckets = self._init_buckets(
+            bucket_size_minutes, max_game_length)
+        self.bucket_size_minutes = bucket_size_minutes
+
+
+    def __str__(self):
+        buckets = 'Buckets:\n'
+        for b in self.buckets:
+            buckets += '{}'.format(b)
+        return str('{}:\n{}\n\n'.format(self.key, buckets))
+
+    def _init_buckets(self, bucket_size_minutes, max_game_length):
+        buckets = []
+        for n in range(0, max_game_length, bucket_size_minutes):
+            buckets.append(Bucket(n, n + bucket_size_minutes))
+
+        return buckets
+
+    def handle_event(self, event):
+        minute = math.floor(event.second / 60)
+        bucket = math.floor((minute - minute % self.bucket_size_minutes) / self.bucket_size_minutes)
+
+        ev = event.name
+        try:
+            if ev is 'SetControlGroupEvent':
+                self.buckets[bucket].set_event()
+            elif ev is 'GetControlGroupEvent':
+                self.buckets[bucket].get_event()
+            elif ev is 'AddToControlGroupEvent':
+                self.buckets[bucket].add_event()
+        except Exception as e:
+            print('Cannot handle event - game is probably too long: min={} bucket={} error={}'.format(minute, bucket, e))
+
+    def get_bucket_labels(self):
+        return [b.__str__() for b in self.buckets]
+
+    def get_dataset(self):
+        dataset = []
+        for b in self.buckets:
+            dataset += b.get_dataset()
+        return dataset
+
+
+class Bucket:
+    def __init__(self, lower_bound, upper_bound):
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.set_events = 0
+        self.get_events = 0
+        self.add_events = 0
+
+    def __str__(self):
+        return '{} -> {}'.format(self.lower_bound, self.upper_bound)
+
+    def verbose(self):
+        return '    [{} -> {}]: {} {} {}\n'.format(
+            self.lower_bound, self.upper_bound,
+            self.set_events,self.get_events, self.add_events)
+
+    def set_event(self):
+        self.set_events += 1
+
+    def get_event(self):
+        self.get_events += 1
+
+    def add_event(self):
+        self.add_events += 1
+
+    def get_dataset(self):
+        return [self.set_events, self.get_events, self.add_events]
+
+def get_players(replay):
+    players = []
+    for p in replay.players:
+        players.append(Player(p))
+
+    player_dict = dict()
+    for p in players:
+        player_dict[p.name] = p
+
+    return player_dict
+
+# Train a classifier using all replay files in the given directory
+def train_classifier(replay_directory):
+    # Recursively find all .SC2Replay files in the given directory
+    training_files = [os.path.join(root, fname) for root, _, files in os.walk(
+            replay_directory) for fname in files if '.SC2Replay' in fname]
+
+    X = []  # Data
+    y = []  # Labels
+
+    file_count = len(training_files)
+    for n, filename in enumerate(training_files):
+        replay = sc2.load_replay(filename, load_level=4)
+
+        players = get_players(replay)
+
+        print('Processing {} of {}\n{} vs {} on {}\n'.format(n+1, file_count, replay.players[0], replay.players[1], replay.map_name))
+
+        for event in replay.game_events:
+            player_name = event.player.name
+            if player_name not in players:
+                continue
+
+            if event.name in ['AddToControlGroupEvent', 'SetControlGroupEvent', 'GetControlGroupEvent']:
+                players[player_name].handle_event(event)
+
+        for name, player in players.items():
+            X.append(player.get_dataset())
+            y.append(player.__str__())
+
+    X = np.asarray(X)
+    y = np.asarray(y)
+
+    print('shape(X)={}, shape(y)={}'.format(X.shape, y.shape))
+    print('Constructing classifier...')
+    clf = tree.DecisionTreeClassifier()
+    clf = clf.fit(X, y)
+    print('Classifier built successfully!')
+
+    return clf, y
+
+# Load a classifier from a saved .pkl file
+def load_classifier(filename):
+    return joblib.load(filename)
+
+# Try to identify the players in the given replay using the given model
+def classify(clf, filename):
+    replay = sc2.load_replay(filename, load_level=4)
+    log_info = 'Analysing file \'{}\'\n'.format(filename)
+    log_info += 'Map \'{}\' played in region \'{}\' on date {}. Length={}\n'.format(replay.map_name, replay.region, replay.date, replay.length)
+    players = get_players(replay)
+    # log_info += 'Players: {}\n'.format(players)
+
+    for event in replay.game_events:
+        player_name = event.player.name
+        if player_name not in players:
+            continue
+
+        if event.name in ['AddToControlGroupEvent', 'SetControlGroupEvent', 'GetControlGroupEvent']:
+            players[player_name].handle_event(event)
+
+    n = 1
+    for name, player in players.items():
+        data = player.get_dataset()
+        predicted_name = clf.predict(data)
+
+        log_info += 'Player {}: replay=\'{}\', prediction=\'{}\'\n'.format(n, player, predicted_name)
+        n += 1
+
+    log_info += '\n\n'
+
+    return log_info
+    
+
+if __name__ == '__main__':
+    # testing_main()
+    parser = ArgumentParser()
+    parser.add_argument(
+        '--train',
+        type=str,
+        help='Directory containing replay files for training the model (recursive)')
+    parser.add_argument('--load', type=str, help='Filename of a saved model')
+    parser.add_argument('--save', type=str, help='Filename to save the trained model',
+                        default='{}.pkl'.format(datetime.strftime(datetime.now(), '%Y-%m-%d_%H%M')))
+    parser.add_argument('--classify', type=str, nargs='+', help="A directory, or one or more replay filenames to categorise using our model")
+    # parser.add_argument('--classify', type=str, help='A directory containing replays to be categorised using our model')
+    args = parser.parse_args()
+
+    if args.train:
+        clf, labels = train_classifier(args.train)
+
+        # Save classifier for later use
+        print('Saving classifier to file {}'.format(args.save))
+        joblib.dump(clf, args.save)
+        with open(args.save.replace('.pkl', '.labels.txt'), 'w') as f:
+            for label in labels:
+                f.write('{}\n'.format(label))
+
+    elif args.load:
+        clf = load_classifier(args.load)
+    else:
+        clf = None
+
+    if args.classify:
+        if not clf:
+            raise ValueError('No classifier - please provide a replay directory or a previously saved model')
+
+        # Write output to a timestamped directory
+        output_dir = datetime.strftime(datetime.now(), '%Y-%m-%d_%H%M%S')
+        os.mkdir(output_dir)
+        with open(os.path.join(output_dir, 'about.txt'), 'w') as f:
+            f.write('{}\n\n'.format(args))
+
+            files = []
+            for file_or_dir in args.classify:
+                if os.path.isfile(file_or_dir) and '.SC2Replay' in file_or_dir:
+                    files.append(file_or_dir)
+                if os.path.isdir(file_or_dir):
+                    files += [os.path.join(root, fname) for root, _, files in os.walk(file_or_dir) for fname in files if '.SC2Replay' in fname]
+
+            print('Classifying {} files: {}'.format(len(files), files))
+
+            for replay in files:
+                info = classify(clf, replay)
+                print(info)
+                f.write(info)
+
+        print('Done!')
