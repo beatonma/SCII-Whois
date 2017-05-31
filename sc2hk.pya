@@ -324,9 +324,6 @@ if __name__ == '__main__':
         # Save classifier for later use
         print('Saving classifier to file {}'.format(args.save))
         joblib.dump(clf, os.path.join('models', args.save))
-        # with open(args.save.replace('.pkl', '.labels.txt'), 'w') as f:
-        #     for label in labels:
-        #         f.write('{}\n'.format(label))
         model_info.save()
 
     elif args.load:
