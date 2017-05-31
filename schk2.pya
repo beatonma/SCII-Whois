@@ -276,7 +276,7 @@ def classify(clf, filename):
     n = 1
     for name, player in players.items():
         mismatch = None
-        data = player.get_dataset()
+        data = [player.get_dataset()]
         prediction = clf.predict(data)
 
         player_name = '{}'.format(player)
@@ -288,8 +288,11 @@ def classify(clf, filename):
             mismatch = {
                 'name': player_name,
                 'prediction': prediction_name,
-                'replay': filename
+                'replay': filename,
+                'game_length': '{}'.format(replay.game_length),
+                'opponent': '{}'.format([p for p in players if p != name][0])
             }
+
             log_info += '# MISMATCH #\n'
             mismatches.append(mismatch)
         n += 1
@@ -336,12 +339,12 @@ if __name__ == '__main__':
             raise ValueError('No classifier - please provide a replay directory or a previously saved model')
 
         # Write output to a timestamped directory
-        output_dir = datetime.strftime(datetime.now(), '%Y-%m-%d_%H%M%S')
+        output_dir = 'logs'
         os.mkdir(output_dir)
 
         model_name = args.load if args.load else args.save
         model_info = ModelInfo(model_name)
-        with open(os.path.join(output_dir, 'about.txt'), 'w') as f:
+        with open(os.path.join(output_dir, '{}.txt'.format(datetime.strftime(datetime.now(), '%Y-%m-%d_%H%M%S'))), 'w') as f:
             f.write('{}\n\n'.format(args))
 
             files = []
